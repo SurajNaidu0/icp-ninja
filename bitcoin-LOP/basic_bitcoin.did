@@ -44,6 +44,41 @@ type order_withdraw_info = record {
   order_details : order_detail;
 };
 
+// New order system types
+type htlc_type = variant {
+  P2TR;
+  P2WSH;
+  ICPEscrow;
+};
+
+type maker_key = record {
+  source_address : text;
+  destination_address : text;
+};
+
+type auction_details = record {
+  initial_rate_bump : nat64;
+  points : vec nat64;
+  duration : nat64;
+  start_time : nat64;
+};
+
+type order_detail_new = record {
+  salt : nat64;
+  maker_key : maker_key;
+  htlc_type : htlc_type;
+  dst_chain_id : nat64;
+  making_amount : nat64;
+  taking_amount : nat64;
+  taking_asset : text;
+  hashlock : text;
+  timelock : nat64;
+  auction : auction_details;
+  allow_partial_fills : bool;
+  order_contract_bitcoin_path : nat32;
+  order_address : opt text;
+};
+
 service : (network) -> {
   // Basic Bitcoin functionality
   "get_balance" : (address : bitcoin_address) -> (satoshi);
@@ -58,4 +93,13 @@ service : (network) -> {
   "get_order_address" : (order_no: nat64) -> (variant { Ok: text; Err: text });
   "preview_order_withdrawal" : (order_no: nat64, responder_pubkey: text) -> (variant { Ok: order_withdraw_info; Err: text });
   "execute_order_withdraw_to_htlc" : (order_no: nat64, responder_pubkey: text, amount_in_satoshi: nat64) -> (variant { Ok: text; Err: text });
+  "recover_order" : (order_no: nat64, recovery_address: text, amount_in_satoshi: nat64) -> (variant { Ok: text; Err: text });
+
+  // New Order Protocol functionality
+  "create_order_new" : (salt: nat64, maker_key: maker_key, htlc_type: htlc_type, dst_chain_id: nat64, making_amount: nat64, taking_amount: nat64, taking_asset: text, hashlock: text, timelock: nat64, auction: auction_details, allow_partial_fills: bool) -> (variant { Ok: text; Err: text });
+  "get_order_new" : (order_hash: text) -> (opt order_detail_new) query;
+  "get_all_orders_new" : () -> (vec record { text; order_detail_new }) query;
+  "get_orders_count_new" : () -> (nat32) query;
+  "get_next_bitcoin_path_new" : () -> (nat32) query;
+  "get_order_address_new" : (order_hash: text) -> (variant { Ok: text; Err: text });
 };

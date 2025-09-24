@@ -8,6 +8,7 @@ pub mod get_current_fee_percentiles;
 // pub mod get_p2wpkh_address;
 pub mod get_utxos;
 pub mod htlc_orders;
+pub mod htlc_order_new;
 // pub mod inscribe_brc20;
 // pub mod inscribe_ordinal;
 // pub mod send_from_p2pkh_address;

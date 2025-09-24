@@ -370,3 +370,112 @@ pub async fn execute_order_withdraw_to_htlc(order_no: u64, responder_pubkey: Str
     // Return the transaction ID
     Ok(signed_transaction.compute_txid().to_string())
 }
+
+/// Recovers all funds from an order address to a specified recovery address
+/// Takes order number, recovery address, and optional amount (if 0, sends all available funds)
+#[update]
+pub async fn recover_order(order_no: u64, recovery_address: String, amount_in_satoshi: u64) -> Result<String, String> {
+    let ctx = BTC_CONTEXT.with(|ctx| ctx.get());
+
+    // Check if the order exists
+    let order_exists = STORAGE.with(|s| {
+        s.borrow().orders.contains_key(&order_no)
+    });
+
+    if !order_exists {
+        return Err(format!("Order {} does not exist", order_no));
+    }
+
+    // Parse and validate the recovery address
+    let recovery_addr = Address::from_str(&recovery_address)
+        .map_err(|_| "Invalid recovery address format".to_string())?
+        .require_network(ctx.bitcoin_network)
+        .map_err(|_| "Recovery address not valid for current network".to_string())?;
+
+    // Get the P2WPKH address for this order (source address)
+    let derivation_path = DerivationPath::p2wpkh(order_no as u32, 0);
+    let own_public_key = get_ecdsa_public_key(&ctx, derivation_path.to_vec_u8_path()).await;
+    let own_compressed_public_key = CompressedPublicKey::from_slice(&own_public_key)
+        .map_err(|e| format!("Failed to create public key: {}", e))?;
+    let own_public_key = PublicKey::from_slice(&own_public_key)
+        .map_err(|e| format!("Failed to create public key: {}", e))?;
+    let own_address = Address::p2wpkh(&own_compressed_public_key, ctx.bitcoin_network);
+
+    // Get UTXOs from the order's P2WPKH address
+    let own_utxos = bitcoin_get_utxos(&GetUtxosRequest {
+        address: own_address.to_string(),
+        network: ctx.network,
+        filter: None,
+    })
+    .await
+    .map_err(|e| format!("Failed to get UTXOs: {:?}", e))?
+    .utxos;
+
+    if own_utxos.is_empty() {
+        return Err("No UTXOs available for this order".to_string());
+    }
+
+    // Get the total balance of the order address
+    let total_balance = bitcoin_get_balance(&GetBalanceRequest {
+        address: own_address.to_string(),
+        network: ctx.network,
+        min_confirmations: None,
+    })
+    .await
+    .map_err(|e| format!("Failed to get balance: {:?}", e))?;
+
+    if total_balance == 0 {
+        return Err("No funds available to recover".to_string());
+    }
+
+    // Determine the amount to send
+    let amount_to_send = if amount_in_satoshi == 0 {
+        // Send all available funds (will be calculated after fee estimation)
+        total_balance
+    } else {
+        if amount_in_satoshi > total_balance {
+            return Err(format!(
+                "Insufficient balance: {} satoshis available, but {} satoshis requested", 
+                total_balance, 
+                amount_in_satoshi
+            ));
+        }
+        amount_in_satoshi
+    };
+
+    // Build the transaction that sends funds to the recovery address
+    let fee_per_byte = get_fee_per_byte(&ctx).await;
+    let (transaction, prevouts) = p2wpkh::build_transaction(
+        &ctx,
+        &own_public_key,
+        &own_address,
+        &own_utxos,
+        &recovery_addr,
+        amount_to_send,
+        fee_per_byte,
+    )
+    .await;
+
+    // Sign the transaction
+    let signed_transaction = p2wpkh::sign_transaction(
+        &ctx,
+        &own_public_key,
+        &own_address,
+        transaction,
+        &prevouts,
+        derivation_path.to_vec_u8_path(),
+        sign_with_ecdsa,
+    )
+    .await;
+
+    // Send the transaction to the Bitcoin network
+    bitcoin_send_transaction(&SendTransactionRequest {
+        network: ctx.network,
+        transaction: serialize(&signed_transaction),
+    })
+    .await
+    .map_err(|e| format!("Failed to send transaction: {:?}", e))?;
+
+    // Return the transaction ID
+    Ok(signed_transaction.compute_txid().to_string())
+}

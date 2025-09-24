@@ -89,5 +89,11 @@ pub struct SendRequest {
 // Re-export Order Protocol functionality
 pub use service::htlc_orders::{
     create_order, get_order, get_all_orders, get_next_order_no, get_order_address, 
-    execute_order_withdraw_to_htlc, preview_order_withdrawal, OrderDetail, OrderWithdrawInfo
+    execute_order_withdraw_to_htlc, preview_order_withdrawal, recover_order, OrderDetail, OrderWithdrawInfo
+};
+
+// Re-export New Order Protocol functionality
+pub use service::htlc_order_new::{
+    create_order_new, get_order_new, get_all_orders_new, get_orders_count_new, get_next_bitcoin_path_new, get_order_address_new,
+    OrderDetailNew, HtlcType, MakerKey, AuctionDetails
 };
