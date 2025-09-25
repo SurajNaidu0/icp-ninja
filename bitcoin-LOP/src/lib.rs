@@ -98,5 +98,5 @@ pub use service::htlc_order_new::{
     calculate_auction_price, validate_auction_bid, get_auction_status, execute_auction_redemption,
     get_order_fill_status, is_order_fully_filled, get_remaining_amount, generate_secrets_for_partial_fills, generate_p2tr_htlc_address_test,
     create_icp_escrow, redeem_icp_escrow, refund_icp_escrow, get_icp_escrow, get_icp_escrows_for_principal,
-    OrderDetailNew, HtlcType, MakerKey, TakerKey, AuctionDetails, PartialFill, OrderFillStatus, SecretManagement, ICPEscrow, ICPEscrowStatus
+    OrderDetailNew, HtlcType, MakerKey, TakerKey, AuctionDetails, PartialFill, OrderFillStatus, SecretManagement, ICPEscrow as ICPEscrowRecord, ICPEscrowStatus
 };
