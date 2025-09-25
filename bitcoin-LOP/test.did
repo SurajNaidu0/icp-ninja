@@ -1,3 +1,0 @@
-service : () -> {
-  "test_function" : (principal: text) -> (variant { Ok: text; Err: text }) query;
-};

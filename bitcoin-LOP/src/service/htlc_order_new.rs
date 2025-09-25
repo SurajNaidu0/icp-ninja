@@ -92,7 +92,6 @@ fn calculate_order_hash(order: &OrderDetailNew) -> String {
 pub enum HtlcType {
     P2TR,      // Taproot - requires x-only public key
     P2WSH,     // P2WSH - requires compressed public key
-    ICPEscrow, // ICP Escrow - requires Bitcoin address
 }
 
 /// Maker key structure with source and destination addresses
@@ -138,25 +137,6 @@ pub struct SecretManagement {
     pub secret_hashes: Vec<String>, // All secret hashes (for validation)
 }
 
-#[derive(CandidType, Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct ICPEscrow {
-    pub escrow_id: String,            // Internal transfer ID
-    pub amount: u64,                  // Amount in e8s (ICP smallest unit)
-    pub secret_hash: String,          // Hash of the secret
-    pub initiator: String,            // Initiator principal ID
-    pub responder: String,            // Responder principal ID
-    pub timelock: u64,               // Timelock in seconds
-    pub created_at: u64,             // Creation timestamp
-    pub status: ICPEscrowStatus,      // Current status
-}
-
-#[derive(CandidType, Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum ICPEscrowStatus {
-    Pending,     // Escrow created, waiting for redemption
-    Redeemed,    // Successfully redeemed with secret
-    Refunded,    // Refunded after timelock
-    Expired,     // Expired without action
-}
 
 /// Partial fill tracking for an order
 #[derive(CandidType, Clone, Debug, serde::Deserialize)]
@@ -216,7 +196,6 @@ impl OrderStorageNew {
 
 thread_local! {
     static STORAGE_NEW: RefCell<OrderStorageNew> = RefCell::new(OrderStorageNew::new());
-    static ICP_ESCROWS: RefCell<HashMap<String, ICPEscrow>> = RefCell::new(HashMap::new());
 }
 
 /// Creates a new order with enhanced parameters
@@ -258,12 +237,6 @@ pub fn create_order_new(
                 return Err("Source pubkey is required for P2WSH HTLC type".to_string());
             }
         },
-        HtlcType::ICPEscrow => {
-            // For ICP Escrow, require source_address (Bitcoin address)
-            if !is_valid_bitcoin_address(&maker_key.source_address) {
-                return Err("Source address must be a valid Bitcoin address for ICP Escrow".to_string());
-            }
-        }
     }
     
     // Validate destination address (always EVM)
@@ -755,9 +728,6 @@ pub async fn execute_auction_redemption(
                 return Err("Invalid taker destination_pubkey (not a valid compressed pubkey for P2WSH)".to_string());
             }
         },
-        HtlcType::ICPEscrow => {
-            return Err("ICP Escrow does not use HTLC scripts".to_string());
-        }
     }
 
     // Check if this is a partial fill
@@ -808,10 +778,6 @@ pub async fn execute_auction_redemption(
                 .as_ref()
                 .ok_or("Maker source_pubkey required for P2WSH HTLC")?
         },
-        HtlcType::ICPEscrow => {
-            // For ICP Escrow, we don't use HTLC scripts, so this shouldn't be called
-            return Err("ICP Escrow does not use HTLC address generation".to_string());
-        }
     };
 
     // Generate HTLC address based on HTLC type
@@ -836,10 +802,6 @@ pub async fn execute_auction_redemption(
                 ctx.bitcoin_network,
             )?
         },
-        HtlcType::ICPEscrow => {
-            // For ICP Escrow, we don't use HTLC scripts
-            return Err("ICP Escrow does not use HTLC address generation".to_string());
-        }
     };
 
     // Get the order's P2WPKH address (source address)
@@ -1305,141 +1267,8 @@ pub fn generate_p2tr_htlc_address_test(
     ).map(|addr| addr.to_string())
 }
 
-/// Create an ICP Escrow (internal transfer with HTLC-like logic)
-#[update]
-pub fn create_icp_escrow(
-    amount: u64,
-    secret_hash: String,
-    responder: String,
-    timelock: u64,
-) -> Result<String, String> {
-    // Validate inputs
-    if amount == 0 {
-        return Err("Amount must be greater than 0".to_string());
-    }
-    
-    if secret_hash.len() != 64 {
-        return Err("Secret hash must be 64 hex characters".to_string());
-    }
-    
-    if timelock == 0 {
-        return Err("Timelock must be greater than 0".to_string());
-    }
-    
-    // Generate unique escrow ID
-    let escrow_id = format!("icp_escrow_{}", ic_cdk::api::time());
-    
-    // Get current timestamp
-    let created_at = ic_cdk::api::time() / 1_000_000_000; // Convert to seconds
-    
-    // Create ICP Escrow
-    let escrow = ICPEscrow {
-        escrow_id: escrow_id.clone(),
-        amount,
-        secret_hash,
-        initiator: ic_cdk::api::msg_caller().to_string(),
-        responder,
-        timelock,
-        created_at,
-        status: ICPEscrowStatus::Pending,
-    };
-    
-    // Store the escrow
-    ICP_ESCROWS.with(|escrows| {
-        let mut escrows = escrows.borrow_mut();
-        escrows.insert(escrow_id.clone(), escrow);
-    });
-    
-    Ok(escrow_id)
-}
 
-/// Redeem an ICP Escrow with the secret
-#[update]
-pub fn redeem_icp_escrow(
-    escrow_id: String,
-    secret: String,
-) -> Result<String, String> {
-    // Validate secret format
-    if secret.len() != 64 {
-        return Err("Secret must be 64 hex characters".to_string());
-    }
-    
-    // Get the escrow
-    let mut escrow = ICP_ESCROWS.with(|escrows| {
-        let mut escrows = escrows.borrow_mut();
-        escrows.get_mut(&escrow_id).cloned()
-    }).ok_or("Escrow not found")?;
-    
-    // Check if escrow is still pending
-    match escrow.status {
-        ICPEscrowStatus::Pending => {},
-        ICPEscrowStatus::Redeemed => return Err("Escrow already redeemed".to_string()),
-        ICPEscrowStatus::Refunded => return Err("Escrow already refunded".to_string()),
-        ICPEscrowStatus::Expired => return Err("Escrow has expired".to_string()),
-    }
-    
-    // Verify the secret hash
-    let secret_hash = sha256(secret.as_bytes());
-    if secret_hash != escrow.secret_hash {
-        return Err("Invalid secret".to_string());
-    }
-    
-    // Update escrow status
-    escrow.status = ICPEscrowStatus::Redeemed;
-    
-    // Store updated escrow
-    ICP_ESCROWS.with(|escrows| {
-        let mut escrows = escrows.borrow_mut();
-        escrows.insert(escrow_id.clone(), escrow);
-    });
-    
-    Ok(format!("Escrow {} successfully redeemed", escrow_id))
-}
 
-/// Refund an ICP Escrow after timelock expires
-#[update]
-pub fn refund_icp_escrow(
-    escrow_id: String,
-) -> Result<String, String> {
-    // Get the escrow
-    let mut escrow = ICP_ESCROWS.with(|escrows| {
-        let mut escrows = escrows.borrow_mut();
-        escrows.get_mut(&escrow_id).cloned()
-    }).ok_or("Escrow not found")?;
-    
-    // Check if escrow is still pending
-    match escrow.status {
-        ICPEscrowStatus::Pending => {},
-        ICPEscrowStatus::Redeemed => return Err("Escrow already redeemed".to_string()),
-        ICPEscrowStatus::Refunded => return Err("Escrow already refunded".to_string()),
-        ICPEscrowStatus::Expired => return Err("Escrow has expired".to_string()),
-    }
-    
-    // Check if timelock has expired
-    let current_time = ic_cdk::api::time() / 1_000_000_000; // Convert to seconds
-    if current_time < escrow.created_at + escrow.timelock {
-        return Err("Timelock has not expired yet".to_string());
-    }
-    
-    // Update escrow status
-    escrow.status = ICPEscrowStatus::Refunded;
-    
-    // Store updated escrow
-    ICP_ESCROWS.with(|escrows| {
-        let mut escrows = escrows.borrow_mut();
-        escrows.insert(escrow_id.clone(), escrow);
-    });
-    
-    Ok(format!("Escrow {} successfully refunded", escrow_id))
-}
 
-/// Get ICP Escrow details
-#[query]
-pub fn get_icp_escrow(escrow_id: String) -> Result<ICPEscrow, String> {
-    ICP_ESCROWS.with(|escrows| {
-        let escrows = escrows.borrow();
-        escrows.get(&escrow_id).cloned()
-    }).ok_or("Escrow not found".to_string())
-}
 
 
