@@ -138,7 +138,7 @@ pub struct SecretManagement {
     pub secret_hashes: Vec<String>, // All secret hashes (for validation)
 }
 
-#[derive(CandidType, Clone, Debug, serde::Deserialize)]
+#[derive(CandidType, Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct ICPEscrow {
     pub escrow_id: String,            // Internal transfer ID
     pub amount: u64,                  // Amount in e8s (ICP smallest unit)
@@ -150,7 +150,7 @@ pub struct ICPEscrow {
     pub status: ICPEscrowStatus,      // Current status
 }
 
-#[derive(CandidType, Clone, Debug, serde::Deserialize)]
+#[derive(CandidType, Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum ICPEscrowStatus {
     Pending,     // Escrow created, waiting for redemption
     Redeemed,    // Successfully redeemed with secret
@@ -1444,15 +1444,19 @@ pub fn get_icp_escrow(escrow_id: String) -> Result<ICPEscrow, String> {
 
 /// Get all ICP Escrows for a principal
 #[query]
-pub fn get_icp_escrows_for_principal(principal: String) -> Result<Vec<ICPEscrow>, String> {
+pub fn get_icp_escrows_for_principal(principal: String) -> Result<String, String> {
     let escrows = ICP_ESCROWS.with(|escrows| {
         let escrows = escrows.borrow();
         escrows.values()
             .filter(|escrow| escrow.initiator == principal || escrow.responder == principal)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>()
     });
     
-    Ok(escrows)
+    // Convert to JSON string for now
+    match serde_json::to_string(&escrows) {
+        Ok(json) => Ok(json),
+        Err(e) => Err(format!("Failed to serialize escrows: {}", e))
+    }
 }
 

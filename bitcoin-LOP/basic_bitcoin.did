@@ -91,7 +91,7 @@ type secret_management = record {
   secret_hashes : vec text;
 };
 
-type escrow = record {
+type escrow_data = record {
   escrow_id : text;
   amount : nat64;
   secret_hash : text;
@@ -108,6 +108,8 @@ type icp_escrow_status = variant {
   Refunded;
   Expired;
 };
+
+type escrow_list = vec escrow_data;
 
 type order_detail_new = record {
   salt : nat64;
@@ -173,8 +175,8 @@ service : (network) -> {
   "create_icp_escrow" : (amount: nat64, secret_hash: text, responder: text, timelock: nat64) -> (variant { Ok: text; Err: text });
   "redeem_icp_escrow" : (escrow_id: text, secret: text) -> (variant { Ok: text; Err: text });
   "refund_icp_escrow" : (escrow_id: text) -> (variant { Ok: text; Err: text });
-  "get_icp_escrow" : (escrow_id: text) -> (variant { Ok: escrow; Err: text }) query;
-  "get_icp_escrows_for_principal" : (principal: text) -> (variant { Ok: vec escrow; Err: text }) query;
+  "get_icp_escrow" : (escrow_id: text) -> (variant { Ok: escrow_data; Err: text }) query;
+  "get_icp_escrows_for_principal" : (principal: text) -> (variant { Ok: text; Err: text }) query;
 
   // Testing and validation
   "test_secret_selection_logic" : (order_hash: text, test_fill_amounts: vec nat64) -> (variant { Ok: vec record { nat64; nat64; float64; text }; Err: text }) query;
