@@ -97,6 +97,6 @@ pub use service::htlc_order_new::{
     create_order_new, get_order_new, get_all_orders_new, get_orders_count_new, get_next_bitcoin_path_new, get_order_address_new,
     calculate_auction_price, validate_auction_bid, get_auction_status, execute_auction_redemption,
     get_order_fill_status, is_order_fully_filled, get_remaining_amount, generate_secrets_for_partial_fills, generate_p2tr_htlc_address_test,
-    create_icp_escrow, redeem_icp_escrow, refund_icp_escrow, get_icp_escrow, get_icp_escrows_for_principal,
+    create_icp_escrow, redeem_icp_escrow, refund_icp_escrow, get_icp_escrow,
     OrderDetailNew, HtlcType, MakerKey, TakerKey, AuctionDetails, PartialFill, OrderFillStatus, SecretManagement, ICPEscrow as ICPEscrowRecord, ICPEscrowStatus
 };

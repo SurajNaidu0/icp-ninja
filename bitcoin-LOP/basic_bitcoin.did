@@ -176,7 +176,6 @@ service : (network) -> {
   "redeem_icp_escrow" : (escrow_id: text, secret: text) -> (variant { Ok: text; Err: text });
   "refund_icp_escrow" : (escrow_id: text) -> (variant { Ok: text; Err: text });
   "get_icp_escrow" : (escrow_id: text) -> (variant { Ok: escrow_data; Err: text }) query;
-  "get_icp_escrows_for_principal" : (principal: text) -> (variant { Ok: text; Err: text }) query;
 
   // Testing and validation
   "test_secret_selection_logic" : (order_hash: text, test_fill_amounts: vec nat64) -> (variant { Ok: vec record { nat64; nat64; float64; text }; Err: text }) query;

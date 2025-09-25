@@ -1442,21 +1442,4 @@ pub fn get_icp_escrow(escrow_id: String) -> Result<ICPEscrow, String> {
     }).ok_or("Escrow not found".to_string())
 }
 
-/// Get all ICP Escrows for a principal
-#[query]
-pub fn get_icp_escrows_for_principal(principal: String) -> Result<String, String> {
-    let escrows = ICP_ESCROWS.with(|escrows| {
-        let escrows = escrows.borrow();
-        escrows.values()
-            .filter(|escrow| escrow.initiator == principal || escrow.responder == principal)
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    
-    // Convert to JSON string for now
-    match serde_json::to_string(&escrows) {
-        Ok(json) => Ok(json),
-        Err(e) => Err(format!("Failed to serialize escrows: {}", e))
-    }
-}
 
