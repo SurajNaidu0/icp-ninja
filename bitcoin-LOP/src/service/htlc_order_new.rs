@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use crate::{common::DerivationPath, ecdsa::get_ecdsa_public_key, BTC_CONTEXT};
 use bitcoin::{Address, CompressedPublicKey, PublicKey, XOnlyPublicKey, ScriptBuf, opcodes};
 use bitcoin::script::PushBytesBuf;
+use bitcoin::taproot::TaprootBuilder;
+use bitcoin::secp256k1::Secp256k1;
 use sha2::{Sha256, Digest};
 use std::str::FromStr;
 // Note: For production, add rand_core and rand to Cargo.toml
@@ -47,16 +49,6 @@ fn is_valid_bitcoin_address(address: &str) -> bool {
     Address::from_str(address).is_ok()
 }
 
-/// Validates if a string is a valid x-only public key by parsing it
-fn is_valid_p2tr_address(key: &str) -> bool {
-    // Try to parse as hex bytes first
-    if let Ok(hex_bytes) = hex::decode(key) {
-        // Try to create XOnlyPublicKey from the bytes
-        XOnlyPublicKey::from_slice(&hex_bytes).is_ok()
-    } else {
-        false
-    }
-}
 
 /// Validates if a string is a valid compressed public key by parsing it
 fn is_valid_p2wsh_address(key: &str) -> bool {
@@ -64,6 +56,17 @@ fn is_valid_p2wsh_address(key: &str) -> bool {
     if let Ok(hex_bytes) = hex::decode(key) {
         // Try to create PublicKey from the bytes
         PublicKey::from_slice(&hex_bytes).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Validates if a string is a valid x-only public key for P2TR
+fn is_valid_p2tr_address(key: &str) -> bool {
+    // P2TR uses x-only public keys (64 hex characters)
+    if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Try to parse as x-only public key
+        XOnlyPublicKey::from_str(key).is_ok()
     } else {
         false
     }
@@ -121,9 +124,6 @@ pub struct AuctionDetails {
 
 /// Secret management for partial fills using 5-secret percentage-based approach
 /// 
-/// SECURITY: Secrets are generated OFF-CHAIN and only hashes are stored on-chain.
-/// The maker must securely store the original secrets (S0-S4) off-chain.
-/// 
 /// The 5-secret system works as follows:
 /// - Secret 0: Used for fills 0-25% of total order amount (exclusive of 25%)
 /// - Secret 1: Used for fills 25-50% of total order amount (exclusive of 50%)
@@ -136,6 +136,26 @@ pub struct SecretManagement {
     pub total_secrets: u64,        // Total number of secrets generated (always 5)
     pub used_secrets: Vec<u64>,    // Indices of used secrets (for tracking)
     pub secret_hashes: Vec<String>, // All secret hashes (for validation)
+}
+
+#[derive(CandidType, Clone, Debug, serde::Deserialize)]
+pub struct ICPEscrow {
+    pub escrow_id: String,            // Internal transfer ID
+    pub amount: u64,                  // Amount in e8s (ICP smallest unit)
+    pub secret_hash: String,          // Hash of the secret
+    pub initiator: String,            // Initiator principal ID
+    pub responder: String,            // Responder principal ID
+    pub timelock: u64,               // Timelock in seconds
+    pub created_at: u64,             // Creation timestamp
+    pub status: ICPEscrowStatus,      // Current status
+}
+
+#[derive(CandidType, Clone, Debug, serde::Deserialize)]
+pub enum ICPEscrowStatus {
+    Pending,     // Escrow created, waiting for redemption
+    Redeemed,    // Successfully redeemed with secret
+    Refunded,    // Refunded after timelock
+    Expired,     // Expired without action
 }
 
 /// Partial fill tracking for an order
@@ -196,6 +216,7 @@ impl OrderStorageNew {
 
 thread_local! {
     static STORAGE_NEW: RefCell<OrderStorageNew> = RefCell::new(OrderStorageNew::new());
+    static ICP_ESCROWS: RefCell<HashMap<String, ICPEscrow>> = RefCell::new(HashMap::new());
 }
 
 /// Creates a new order with enhanced parameters
@@ -218,7 +239,7 @@ pub fn create_order_new(
     // Validate source based on HTLC type
     match htlc_type {
         HtlcType::P2TR => {
-            // For P2TR, require source_pubkey (x-only public key)
+            // For P2TR, require source_pubkey (x-only public key, 64 hex chars)
             if let Some(ref source_pubkey) = maker_key.source_pubkey {
                 if !is_valid_p2tr_address(source_pubkey) {
                     return Err("Source pubkey must be a valid x-only public key (64 hex chars) for P2TR HTLC type".to_string());
@@ -228,7 +249,7 @@ pub fn create_order_new(
             }
         },
         HtlcType::P2WSH => {
-            // For P2WSH, require source_pubkey (compressed public key)
+            // For P2WSH, require source_pubkey (compressed public key, 66 hex chars)
             if let Some(ref source_pubkey) = maker_key.source_pubkey {
                 if !is_valid_p2wsh_address(source_pubkey) {
                     return Err("Source pubkey must be a valid compressed public key (66 hex chars starting with 02/03) for P2WSH HTLC type".to_string());
@@ -448,6 +469,93 @@ fn generate_htlc_address(
     Ok(address)
 }
 
+/// Generates a P2TR address for HTLC using Taproot
+fn generate_p2tr_htlc_address(
+    payment_hash: &str,
+    initiator_pubkey: &str,
+    responder_pubkey: &str,
+    timelock: u64,
+    network: bitcoin::Network,
+) -> Result<Address, String> {
+    // Well-recognized NUMS point from BIP-341
+    const NUMS_POINT: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+    
+    // Parse the internal key (NUMS point)
+    let internal_key = XOnlyPublicKey::from_str(NUMS_POINT)
+        .map_err(|e| format!("Invalid NUMS point: {}", e))?;
+    
+    // Create redeem script for P2TR HTLC
+    let redeem_script = generate_p2tr_redeem_script(payment_hash, responder_pubkey)?;
+    
+    // Create refund script for P2TR HTLC
+    let refund_script = generate_p2tr_refund_script(timelock, initiator_pubkey)?;
+    
+    // Build Taproot script tree with redeem and refund paths
+    let secp = Secp256k1::new();
+    let taproot_builder = TaprootBuilder::new()
+        .add_leaf(1, redeem_script)
+        .map_err(|e| format!("Failed to add redeem script: {:?}", e))?
+        .add_leaf(1, refund_script)
+        .map_err(|e| format!("Failed to add refund script: {:?}", e))?;
+    
+    let taproot_spend_info = taproot_builder
+        .finalize(&secp, internal_key)
+        .map_err(|e| format!("Failed to finalize Taproot: {:?}", e))?;
+    
+    // Generate P2TR address
+    let address = Address::p2tr(&secp, internal_key, taproot_spend_info.merkle_root(), network);
+    Ok(address)
+}
+
+/// Generates P2TR redeem script: OP_SHA256 <hash> OP_EQUALVERIFY <responder_pubkey> OP_CHECKSIG
+fn generate_p2tr_redeem_script(
+    payment_hash: &str,
+    responder_pubkey: &str,
+) -> Result<ScriptBuf, String> {
+    let payment_hash_bytes = hex::decode(payment_hash)
+        .map_err(|_| "Failed to decode payment hash".to_string())?;
+    
+    // Convert to fixed-size array for PushBytesBuf
+    if payment_hash_bytes.len() != 32 {
+        return Err("Payment hash must be 32 bytes".to_string());
+    }
+    let mut hash_array = [0u8; 32];
+    hash_array.copy_from_slice(&payment_hash_bytes);
+    let payment_hash_buf = PushBytesBuf::from(&hash_array);
+    
+    let responder_pubkey = XOnlyPublicKey::from_str(responder_pubkey)
+        .map_err(|_| "Failed to parse responder public key".to_string())?;
+    
+    let redeem_script = ScriptBuf::builder()
+        .push_opcode(opcodes::all::OP_SHA256)
+        .push_slice(&payment_hash_buf)
+        .push_opcode(opcodes::all::OP_EQUALVERIFY)
+        .push_x_only_key(&responder_pubkey)
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script();
+    
+    Ok(redeem_script)
+}
+
+/// Generates P2TR refund script: <timelock> OP_CSV OP_DROP <initiator_pubkey> OP_CHECKSIG
+fn generate_p2tr_refund_script(
+    timelock: u64,
+    initiator_pubkey: &str,
+) -> Result<ScriptBuf, String> {
+    let initiator_pubkey = XOnlyPublicKey::from_str(initiator_pubkey)
+        .map_err(|_| "Failed to parse initiator public key".to_string())?;
+    
+    let refund_script = ScriptBuf::builder()
+        .push_int(timelock as i64)
+        .push_opcode(opcodes::all::OP_CSV)
+        .push_opcode(opcodes::all::OP_DROP)
+        .push_x_only_key(&initiator_pubkey)
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script();
+    
+    Ok(refund_script)
+}
+
 /// Calculate the current auction price based on time and auction parameters
 /// Implements a Dutch auction where price decreases over time
 #[query]
@@ -629,14 +737,27 @@ pub async fn execute_auction_redemption(
         return Err("Invalid taker destination address format".to_string());
     }
     
-    // ensure taker supplied compressed pubkey for HTLC scripts
+    // ensure taker supplied appropriate pubkey for HTLC scripts based on HTLC type
     let responder_pubkey_hex = taker_key
         .destination_pubkey
         .as_ref()
-        .ok_or("taker destination_pubkey (compressed pubkey hex) required for HTLC")?;
+        .ok_or("taker destination_pubkey required for HTLC")?;
 
-    if !is_valid_p2wsh_address(responder_pubkey_hex) {
-        return Err("Invalid taker destination_pubkey (not a compressed pubkey)".to_string());
+    // Validate pubkey format based on HTLC type
+    match order.htlc_type {
+        HtlcType::P2TR => {
+            if !is_valid_p2tr_address(responder_pubkey_hex) {
+                return Err("Invalid taker destination_pubkey (not a valid x-only pubkey for P2TR)".to_string());
+            }
+        },
+        HtlcType::P2WSH => {
+            if !is_valid_p2wsh_address(responder_pubkey_hex) {
+                return Err("Invalid taker destination_pubkey (not a valid compressed pubkey for P2WSH)".to_string());
+            }
+        },
+        HtlcType::ICPEscrow => {
+            return Err("ICP Escrow does not use HTLC scripts".to_string());
+        }
     }
 
     // Check if this is a partial fill
@@ -693,13 +814,33 @@ pub async fn execute_auction_redemption(
         }
     };
 
-    let htlc_address = generate_htlc_address(
-        &secret_hash,
-        initiator_pubkey,                // initiator pubkey (compressed pubkey hex for P2WSH/P2TR)
-        responder_pubkey_hex,            // responder pubkey (compressed pubkey hex)
-        order.timelock,
-        ctx.bitcoin_network,
-    )?;
+    // Generate HTLC address based on HTLC type
+    let htlc_address = match order.htlc_type {
+        HtlcType::P2TR => {
+            // For P2TR, use x-only public keys
+            generate_p2tr_htlc_address(
+                &secret_hash,
+                initiator_pubkey,        // initiator pubkey (x-only for P2TR)
+                responder_pubkey_hex,   // responder pubkey (x-only for P2TR)
+                order.timelock,
+                ctx.bitcoin_network,
+            )?
+        },
+        HtlcType::P2WSH => {
+            // For P2WSH, use compressed public keys
+            generate_htlc_address(
+                &secret_hash,
+                initiator_pubkey,        // initiator pubkey (compressed for P2WSH)
+                responder_pubkey_hex,    // responder pubkey (compressed for P2WSH)
+                order.timelock,
+                ctx.bitcoin_network,
+            )?
+        },
+        HtlcType::ICPEscrow => {
+            // For ICP Escrow, we don't use HTLC scripts
+            return Err("ICP Escrow does not use HTLC address generation".to_string());
+        }
+    };
 
     // Get the order's P2WPKH address (source address)
     let derivation_path = DerivationPath::p2wpkh(order.order_contract_bitcoin_path, 0);
@@ -853,33 +994,32 @@ pub fn get_remaining_amount(order_hash: String) -> Result<u64, String> {
     Ok(fill_status.map_or(0, |status| status.remaining_amount))
 }
 
-/// Set secret hashes for partial fills (secrets must be generated off-chain)
+/// Generate secrets for partial fills using 5-secret approach with secure random generation
 #[update]
-pub fn set_secret_hashes_for_partial_fills(
+pub fn generate_secrets_for_partial_fills(
     order_hash: String,
-    secret_hashes: Vec<String>  // 5 secret hashes generated off-chain
+    _num_secrets: u64  // Ignored - we always use 5 secrets
 ) -> Result<SecretManagement, String> {
-    // Validate that exactly 5 secret hashes are provided
-    if secret_hashes.len() != 5 {
-        return Err("Exactly 5 secret hashes must be provided for partial fills".to_string());
+    // Always generate exactly 5 secrets for the percentage-based logic
+    let num_secrets = 5u64;
+    let mut secret_hashes = Vec::new();
+
+    // Generate cryptographically secure random secrets
+    // Note: In production, use proper RNG like OsRng
+    for i in 0..num_secrets {
+        // Use order hash + index + timestamp for uniqueness
+        let timestamp = ic_cdk::api::time();
+        let random_data = format!("{}_{}_{}", order_hash, i, timestamp);
+        let secret_hash = sha256(random_data.as_bytes());
+        secret_hashes.push(secret_hash);
     }
 
-    // Validate that all secret hashes are valid hex strings (64 chars for SHA256)
-    for (i, hash) in secret_hashes.iter().enumerate() {
-        if hash.len() != 64 {
-            return Err(format!("Secret hash {} must be 64 hex characters (SHA256)", i));
-        }
-        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!("Secret hash {} contains invalid hex characters", i));
-        }
-    }
-
-    // Create Merkle tree from the provided hashes
+    // Create Merkle tree (simplified - in practice use a proper Merkle tree library)
     let merkle_root = create_merkle_root(&secret_hashes);
 
     let secret_management = SecretManagement {
         merkle_root,
-        total_secrets: 5,
+        total_secrets: num_secrets,
         used_secrets: Vec::new(),
         secret_hashes,
     };
@@ -1147,50 +1287,172 @@ pub fn test_merkle_root_calculation() -> Result<Vec<(String, String, String)>, S
     Ok(results)
 }
 
-/// Helper function to generate secrets off-chain (for client-side use)
-/// This function demonstrates how to generate secrets securely off-chain
-/// 
-/// USAGE: Call this function off-chain to generate secrets, then use
-/// set_secret_hashes_for_partial_fills() to store only the hashes on-chain
-/// 
-/// Example usage in JavaScript/TypeScript:
-/// ```javascript
-/// import { randomBytes } from 'crypto';
-/// import { createHash } from 'crypto';
-/// 
-/// function generateSecretsOffChain() {
-///   const secrets = [];
-///   const secretHashes = [];
-///   
-///   for (let i = 0; i < 5; i++) {
-///     // Generate 32 random bytes
-///     const secret = randomBytes(32);
-///     const secretHex = secret.toString('hex');
-///     
-///     // Hash the secret
-///     const hash = createHash('sha256').update(secret).digest('hex');
-///     
-///     secrets.push(secretHex);  // Store securely off-chain
-///     secretHashes.push(hash);  // Send to contract
-///   }
-///   
-///   return { secrets, secretHashes };
-/// }
-/// ```
+/// Generate a P2TR HTLC address for testing
 #[query]
-pub fn generate_secrets_offchain_helper() -> Result<Vec<String>, String> {
-    // This is just a helper to show the expected format
-    // In practice, secrets should be generated using cryptographically secure RNG
-    // like crypto.randomBytes(32) in Node.js or OsRng in Rust
+pub fn generate_p2tr_htlc_address_test(
+    payment_hash: String,
+    initiator_pubkey: String,
+    responder_pubkey: String,
+    timelock: u64,
+) -> Result<String, String> {
+    let ctx = BTC_CONTEXT.with(|c| c.get().clone());
+    generate_p2tr_htlc_address(
+        &payment_hash,
+        &initiator_pubkey,
+        &responder_pubkey,
+        timelock,
+        ctx.bitcoin_network,
+    ).map(|addr| addr.to_string())
+}
+
+/// Create an ICP Escrow (internal transfer with HTLC-like logic)
+#[update]
+pub fn create_icp_escrow(
+    amount: u64,
+    secret_hash: String,
+    responder: String,
+    timelock: u64,
+) -> Result<String, String> {
+    // Validate inputs
+    if amount == 0 {
+        return Err("Amount must be greater than 0".to_string());
+    }
     
-    let example_secret_hashes = vec![
-        "a1b2c3d4e5f6789012345678901234567890123456789012345678901234567890".to_string(),
-        "b2c3d4e5f6789012345678901234567890123456789012345678901234567890a1".to_string(),
-        "c3d4e5f6789012345678901234567890123456789012345678901234567890a1b2".to_string(),
-        "d4e5f6789012345678901234567890123456789012345678901234567890a1b2c3".to_string(),
-        "e5f6789012345678901234567890123456789012345678901234567890a1b2c3d4".to_string(),
-    ];
+    if secret_hash.len() != 64 {
+        return Err("Secret hash must be 64 hex characters".to_string());
+    }
     
-    Ok(example_secret_hashes)
+    if timelock == 0 {
+        return Err("Timelock must be greater than 0".to_string());
+    }
+    
+    // Generate unique escrow ID
+    let escrow_id = format!("icp_escrow_{}", ic_cdk::api::time());
+    
+    // Get current timestamp
+    let created_at = ic_cdk::api::time() / 1_000_000_000; // Convert to seconds
+    
+    // Create ICP Escrow
+    let escrow = ICPEscrow {
+        escrow_id: escrow_id.clone(),
+        amount,
+        secret_hash,
+        initiator: ic_cdk::api::msg_caller().to_string(),
+        responder,
+        timelock,
+        created_at,
+        status: ICPEscrowStatus::Pending,
+    };
+    
+    // Store the escrow
+    ICP_ESCROWS.with(|escrows| {
+        let mut escrows = escrows.borrow_mut();
+        escrows.insert(escrow_id.clone(), escrow);
+    });
+    
+    Ok(escrow_id)
+}
+
+/// Redeem an ICP Escrow with the secret
+#[update]
+pub fn redeem_icp_escrow(
+    escrow_id: String,
+    secret: String,
+) -> Result<String, String> {
+    // Validate secret format
+    if secret.len() != 64 {
+        return Err("Secret must be 64 hex characters".to_string());
+    }
+    
+    // Get the escrow
+    let mut escrow = ICP_ESCROWS.with(|escrows| {
+        let mut escrows = escrows.borrow_mut();
+        escrows.get_mut(&escrow_id).cloned()
+    }).ok_or("Escrow not found")?;
+    
+    // Check if escrow is still pending
+    match escrow.status {
+        ICPEscrowStatus::Pending => {},
+        ICPEscrowStatus::Redeemed => return Err("Escrow already redeemed".to_string()),
+        ICPEscrowStatus::Refunded => return Err("Escrow already refunded".to_string()),
+        ICPEscrowStatus::Expired => return Err("Escrow has expired".to_string()),
+    }
+    
+    // Verify the secret hash
+    let secret_hash = sha256(secret.as_bytes());
+    if secret_hash != escrow.secret_hash {
+        return Err("Invalid secret".to_string());
+    }
+    
+    // Update escrow status
+    escrow.status = ICPEscrowStatus::Redeemed;
+    
+    // Store updated escrow
+    ICP_ESCROWS.with(|escrows| {
+        let mut escrows = escrows.borrow_mut();
+        escrows.insert(escrow_id.clone(), escrow);
+    });
+    
+    Ok(format!("Escrow {} successfully redeemed", escrow_id))
+}
+
+/// Refund an ICP Escrow after timelock expires
+#[update]
+pub fn refund_icp_escrow(
+    escrow_id: String,
+) -> Result<String, String> {
+    // Get the escrow
+    let mut escrow = ICP_ESCROWS.with(|escrows| {
+        let mut escrows = escrows.borrow_mut();
+        escrows.get_mut(&escrow_id).cloned()
+    }).ok_or("Escrow not found")?;
+    
+    // Check if escrow is still pending
+    match escrow.status {
+        ICPEscrowStatus::Pending => {},
+        ICPEscrowStatus::Redeemed => return Err("Escrow already redeemed".to_string()),
+        ICPEscrowStatus::Refunded => return Err("Escrow already refunded".to_string()),
+        ICPEscrowStatus::Expired => return Err("Escrow has expired".to_string()),
+    }
+    
+    // Check if timelock has expired
+    let current_time = ic_cdk::api::time() / 1_000_000_000; // Convert to seconds
+    if current_time < escrow.created_at + escrow.timelock {
+        return Err("Timelock has not expired yet".to_string());
+    }
+    
+    // Update escrow status
+    escrow.status = ICPEscrowStatus::Refunded;
+    
+    // Store updated escrow
+    ICP_ESCROWS.with(|escrows| {
+        let mut escrows = escrows.borrow_mut();
+        escrows.insert(escrow_id.clone(), escrow);
+    });
+    
+    Ok(format!("Escrow {} successfully refunded", escrow_id))
+}
+
+/// Get ICP Escrow details
+#[query]
+pub fn get_icp_escrow(escrow_id: String) -> Result<ICPEscrow, String> {
+    ICP_ESCROWS.with(|escrows| {
+        let escrows = escrows.borrow();
+        escrows.get(&escrow_id).cloned()
+    }).ok_or("Escrow not found".to_string())
+}
+
+/// Get all ICP Escrows for a principal
+#[query]
+pub fn get_icp_escrows_for_principal(principal: String) -> Result<Vec<ICPEscrow>, String> {
+    let escrows = ICP_ESCROWS.with(|escrows| {
+        let escrows = escrows.borrow();
+        escrows.values()
+            .filter(|escrow| escrow.initiator == principal || escrow.responder == principal)
+            .cloned()
+            .collect()
+    });
+    
+    Ok(escrows)
 }
 

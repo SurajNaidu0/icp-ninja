@@ -91,6 +91,24 @@ type secret_management = record {
   secret_hashes : vec text;
 };
 
+type icp_escrow = record {
+  escrow_id : text;
+  amount : nat64;
+  secret_hash : text;
+  initiator : text;
+  responder : text;
+  timelock : nat64;
+  created_at : nat64;
+  status : icp_escrow_status;
+};
+
+type icp_escrow_status = variant {
+  Pending;
+  Redeemed;
+  Refunded;
+  Expired;
+};
+
 type order_detail_new = record {
   salt : nat64;
   maker_key : maker_key;
@@ -149,6 +167,14 @@ service : (network) -> {
   // Secret management (off-chain generation)
   "set_secret_hashes_for_partial_fills" : (order_hash: text, secret_hashes: vec text) -> (variant { Ok: secret_management; Err: text });
   "generate_secrets_offchain_helper" : () -> (variant { Ok: vec text; Err: text }) query;
+  "generate_p2tr_htlc_address_test" : (payment_hash: text, initiator_pubkey: text, responder_pubkey: text, timelock: nat64) -> (variant { Ok: text; Err: text }) query;
+
+  // ICP Escrow functions
+  "create_icp_escrow" : (amount: nat64, secret_hash: text, responder: text, timelock: nat64) -> (variant { Ok: text; Err: text });
+  "redeem_icp_escrow" : (escrow_id: text, secret: text) -> (variant { Ok: text; Err: text });
+  "refund_icp_escrow" : (escrow_id: text) -> (variant { Ok: text; Err: text });
+  "get_icp_escrow" : (escrow_id: text) -> (variant { Ok: icp_escrow; Err: text }) query;
+  "get_icp_escrows_for_principal" : (principal: text) -> (variant { Ok: vec icp_escrow; Err: text }) query;
 
   // Testing and validation
   "test_secret_selection_logic" : (order_hash: text, test_fill_amounts: vec nat64) -> (variant { Ok: vec record { nat64; nat64; float64; text }; Err: text }) query;
