@@ -53,7 +53,14 @@ type htlc_type = variant {
 
 type maker_key = record {
   source_address : text;
+  source_pubkey : opt text;
   destination_address : text;
+};
+
+type taker_key = record {
+  source_address : text;
+  destination_address : text;
+  destination_pubkey : opt text;
 };
 
 type auction_details = record {
@@ -63,9 +70,31 @@ type auction_details = record {
   start_time : nat64;
 };
 
+type partial_fill = record {
+  taker_key : taker_key;
+  filled_amount : nat64;
+  remaining_amount : nat64;
+  fill_timestamp : nat64;
+};
+
+type order_fill_status = record {
+  total_filled : nat64;
+  remaining_amount : nat64;
+  partial_fills : vec partial_fill;
+  is_fully_filled : bool;
+};
+
+type secret_management = record {
+  merkle_root : text;
+  total_secrets : nat64;
+  used_secrets : vec nat64;
+  secret_hashes : vec text;
+};
+
 type order_detail_new = record {
   salt : nat64;
   maker_key : maker_key;
+  taker_key : opt taker_key;
   htlc_type : htlc_type;
   dst_chain_id : nat64;
   making_amount : nat64;
@@ -77,6 +106,9 @@ type order_detail_new = record {
   allow_partial_fills : bool;
   order_contract_bitcoin_path : nat32;
   order_address : opt text;
+  fill_status : opt order_fill_status;
+  secret_management : opt secret_management;
+  processing : bool;
 };
 
 service : (network) -> {
@@ -102,4 +134,23 @@ service : (network) -> {
   "get_orders_count_new" : () -> (nat32) query;
   "get_next_bitcoin_path_new" : () -> (nat32) query;
   "get_order_address_new" : (order_hash: text) -> (variant { Ok: text; Err: text });
+
+  // Auction functionality
+  "calculate_auction_price" : (order_hash: text) -> (variant { Ok: nat64; Err: text }) query;
+  "validate_auction_bid" : (order_hash: text, bid_price: nat64) -> (variant { Ok: bool; Err: text }) query;
+  "get_auction_status" : (order_hash: text) -> (variant { Ok: text; Err: text }) query;
+  "execute_auction_redemption" : (order_hash: text, taker_key: taker_key, amount_in_satoshi: nat64, bid_price: nat64) -> (variant { Ok: text; Err: text });
+
+  // Partial fill functionality
+  "get_order_fill_status" : (order_hash: text) -> (variant { Ok: opt order_fill_status; Err: text }) query;
+  "is_order_fully_filled" : (order_hash: text) -> (variant { Ok: bool; Err: text }) query;
+  "get_remaining_amount" : (order_hash: text) -> (variant { Ok: nat64; Err: text }) query;
+
+  // Secret management (off-chain generation)
+  "set_secret_hashes_for_partial_fills" : (order_hash: text, secret_hashes: vec text) -> (variant { Ok: secret_management; Err: text });
+  "generate_secrets_offchain_helper" : () -> (variant { Ok: vec text; Err: text }) query;
+
+  // Testing and validation
+  "test_secret_selection_logic" : (order_hash: text, test_fill_amounts: vec nat64) -> (variant { Ok: vec record { nat64; nat64; float64; text }; Err: text }) query;
+  "test_merkle_root_calculation" : () -> (variant { Ok: vec record { text; text; text }; Err: text }) query;
 };
